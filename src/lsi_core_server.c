@@ -459,6 +459,7 @@ create_server_instance(lua_State* L) {
     return server;
 }
 
+#ifdef _WIN32
 void
 close_server_handles(lsi_server* server) {
     for (int j = 0; j < server->max_clients; j++) {
@@ -473,6 +474,7 @@ close_server_handles(lsi_server* server) {
         }
     }
 }
+#endif
 
 int
 lsi_listen(lua_State* L) {
