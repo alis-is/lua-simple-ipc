@@ -21,77 +21,20 @@
 #endif
 
 static void
-#ifdef _WIN32
-push_client_from_server(lua_State* L, int serverindex, HANDLE id) {
-#else
-push_client_from_server(lua_State* L, int serverindex, int id) {
-#endif
-    lua_getiuservalue(L, serverindex, 1);
-    lua_pushinteger(L, (int)id);
+push_client_from_server(lua_State* L, lua_Integer id) {
+    lua_getiuservalue(L, 1, 1);
+    lua_pushinteger(L, id);
     lua_gettable(L, -2);
     lua_remove(L, -2);
 }
 
 static void
-#ifdef _WIN32
-remove_client_from_server(lua_State* L, int serverindex, HANDLE id) {
-#else
-remove_client_from_server(lua_State* L, int serverindex, int id) {
-#endif
-    lua_getiuservalue(L, serverindex, 1);
-    lua_pushinteger(L, (int)id);
+remove_client_from_server(lua_State* L, lua_Integer id) {
+    lua_getiuservalue(L, 1, 1);
+    lua_pushinteger(L, id);
     lua_pushnil(L);
     lua_settable(L, -3);
     lua_pop(L, 1);
-}
-
-static void
-push_cb_error_info(lua_State* L, const char* id, const char* info) {
-    lua_pushstring(L, id);
-    if (info == NULL) {
-        lua_pushstring(L, strerror(errno));
-    } else {
-        lua_pushfstring(L, "%s: %s", info, strerror(errno));
-    }
-    lua_pushinteger(L, errno);
-}
-
-static void
-#ifdef _WIN32
-call_error_cb(lua_State* L, const char* id, int serverindex, int optionindex, HANDLE clientid, char* err) {
-#else
-call_error_cb(lua_State* L, const char* id, int serverindex, int optionindex, int clientid, char* err) {
-#endif
-    if (lua_type(L, optionindex) != LUA_TTABLE) {
-        return;
-    }
-    if (lua_getfield(L, optionindex, "error") == LUA_TFUNCTION) {
-        // call error handler with the error pushed by lua_pcall
-        push_cb_error_info(L, id, err);
-        push_client_from_server(L, serverindex, clientid);
-        lua_pcall(L, 4, 0, 0);
-    } else {
-        lua_pop(L, 1); // discard nil
-    }
-}
-
-static void
-#ifdef _WIN32
-call_cb(lua_State* L, const char* id, int serverindex, int optionindex, HANDLE clientid) {
-#else
-call_cb(lua_State* L, const char* id, int serverindex, int optionindex, int clientid) {
-#endif
-    if (lua_type(L, optionindex) != LUA_TTABLE) {
-        return;
-    }
-    if (lua_getfield(L, 2, id) == LUA_TFUNCTION) {
-        push_client_from_server(L, serverindex, clientid);
-        if ((lua_pcall(L, 1, 0, 0) != LUA_OK)) {
-            call_error_cb(L, id, serverindex, optionindex, clientid, ERROR_CALLBACK_FAILED);
-        }
-    } else {
-        lua_pop(L, 1); // discard nil
-    }
 }
 
 #ifdef _WIN32
@@ -137,6 +80,187 @@ DisconnectAndReconnect(PIPE_INSTANCE* pipeInst) {
 }
 #endif
 
+static void
+callback_error(lua_State* L, const char* id, lua_Integer* clientid, const char* err) {
+    if (lua_type(L, 2) == LUA_TTABLE) {
+        if (lua_getfield(L, 2, "error") == LUA_TFUNCTION) {
+            // call error handler with the error pushed by lua_pcall
+            lua_pushstring(L, "internal"); // error "accept"
+            push_error_string(L, id);
+            if (id != NULL) {
+                push_client_from_server(L, *clientid);
+            } else {
+                lua_pushnil(L);
+            }
+            if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
+                lua_pop(L, 1); // discard error
+            }
+        } else {
+            lua_pop(L, 1); // discard nil
+        }
+    }
+}
+
+// we assume that server is always the first argument
+// and options is always the second argument
+// instanceIndex is relevant only in windows version
+static int
+accept_client(lua_State* L, lsi_server* server, int instanceIndex) {
+    int hasOptions = lua_type(L, 2) == LUA_TTABLE;
+
+    lsi_socket* client = (lsi_socket*)lua_newuserdatauv(L, sizeof(lsi_socket), 0);
+    if (client == NULL) {
+        if (hasOptions) {
+            if (lua_getfield(L, 2, "error") == LUA_TFUNCTION) {
+                // call error handler with the error pushed by lua_pcall
+                lua_pushstring(L, "accept"); // error "accept"
+                push_error_string(L, ERROR_FAILED_TO_CREATE_SOCKET_INSTANCE);
+                if (lua_pcall(L, 2, 0, 0) != LUA_OK) {
+                    lua_pop(L, 1); // discard error
+                }
+            } else {
+                lua_pop(L, 1); // discard nil
+            }
+        }
+    }
+    memset(client, 0, sizeof(lsi_socket));
+    luaL_getmetatable(L, LSI_SOCKET_METATABLE);
+    lua_setmetatable(L, -2);
+    client->server_owned = 1;
+
+#ifdef _WIN32
+    PIPE_INSTANCE* pipe = &server->instances[instanceIndex];
+    client->hPipe = pipe->hPipe;
+    lua_Integer clientid = (lua_Integer)pipe->hPipe;
+#else
+    client->fd = accept(server->fd, NULL, NULL);
+    if (client->fd == -1) {
+        client->closed = 1;
+        lua_pop(L, 1); // discard client userdata
+        return 0;
+    }
+    lua_Integer clientid = (lua_Integer)client->fd;
+#endif
+
+#ifdef _WIN32
+    int shouldAccept = 1;
+#else
+    int shouldAccept = server->client_count < server->max_clients;
+#endif
+    if (hasOptions) {
+        if (shouldAccept && lua_getfield(L, 2, "accept") == LUA_TFUNCTION) {
+            // push client userdata
+            lua_pushvalue(L, -2);
+            if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
+                // call error handler
+                lua_pushstring(L, "accept"); // error "accept"
+                // bring error to the top of the stack
+                lua_insert(L, -2);                    // "accept" error
+                push_client_from_server(L, clientid); // accept error userdata
+                if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
+                    lua_pop(L, 1); // discard error
+                }
+                shouldAccept = 0;
+            } else if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
+                // if call returns false, close the connection
+                shouldAccept = 0;
+            }
+            lua_pop(L, 1); // discard return value
+        } else {
+            lua_pop(L, 1); // discard nil
+        }
+    }
+    if (shouldAccept) {
+#ifdef _WIN32
+        pipe->buffer = (CHAR*)malloc(server->buffer_size * sizeof(CHAR));
+        ReadFile(pipe->hPipe, pipe->buffer, server->buffer_size, &pipe->bytesRead, &pipe->dataOverlap);
+#else
+        server->fds[server->nfds].fd = client->fd;
+        server->fds[server->nfds].events = POLLIN;
+        server->nfds++;
+        server->client_count++;
+#endif
+        lua_getiuservalue(L, 1, 1);
+        lua_pushinteger(L, clientid);
+        lua_pushvalue(L, -3); // push client userdata
+        lua_settable(L, -3);
+        lua_pop(L, 1); // discard uv table
+    } else {
+#ifdef _WIN32
+        if (DisconnectAndReconnect(pipe) == INVALID_HANDLE_VALUE) {
+            callback_error(L, "internal", &clientid, ERROR_FAILED_TO_RECREATE_PIPE);
+        }
+#else
+        close(client->fd);
+#endif
+        client->closed = 1;
+    }
+    lua_pop(L, 1); // discard client userdata
+    return 0;
+}
+
+static void
+client_disconnected(lua_State* L, lsi_server* server, int instanceIndex) {
+    int hasOptions = lua_type(L, 2) == LUA_TTABLE;
+
+#ifdef _WIN32
+    lua_Integer clientid = (lua_Integer)server->instances[instanceIndex].hPipe;
+#else
+    lua_Integer clientid = (lua_Integer)server->fds[instanceIndex].fd;
+#endif
+
+    if (hasOptions) {
+        if (lua_getfield(L, 2, "disconnected") == LUA_TFUNCTION) {
+            lua_pushstring(L, "disconnected");
+            lua_pushinteger(L, clientid);
+            if ((lua_pcall(L, 2, 0, 0) != LUA_OK)) { // error
+                lua_pushstring(L, "disconnected");   // error "disconnected"
+                // bring error to the top of the stack
+                lua_insert(L, -2);                    // "disconnected" error
+                push_client_from_server(L, clientid); // accept error userdata
+                if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
+                    lua_pop(L, 1); // discard error
+                }
+            }
+        } else {
+            lua_pop(L, 1); // discard nil
+        }
+    }
+    remove_client_from_server(L, clientid);
+#ifdef _WIN32
+    if (DisconnectAndReconnect(&(server->instances[instanceIndex])) == INVALID_HANDLE_VALUE) {
+        callback_error(L, "internal", &clientid, ERROR_FAILED_TO_RECREATE_PIPE);
+    }
+#else
+    close(client->fd);
+    server->fds[instanceIndex].fd = -1;
+    server->client_count--;
+#endif
+}
+
+static void
+data_received(lua_State* L, lua_Integer clientid, char* buffer, size_t data_len) {
+    int hasOptions = lua_type(L, 2) == LUA_TTABLE;
+
+    if (hasOptions) {
+        if (lua_getfield(L, 2, "data") == LUA_TFUNCTION) {
+            push_client_from_server(L, clientid);
+            lua_pushlstring(L, buffer, data_len);
+            if ((lua_pcall(L, 2, 0, 0) != LUA_OK)) {
+                lua_pushstring(L, "data"); // error "data"
+                // bring error to the top of the stack
+                lua_insert(L, -2);                    // "data" error
+                push_client_from_server(L, clientid); // data error userdata
+                if (lua_pcall(L, 3, 0, 0) != LUA_OK) {
+                    lua_pop(L, 1); // discard error
+                }
+            }
+        } else {
+            lua_pop(L, 1); // discard nil
+        }
+    }
+}
+
 int
 lsi_server_process_events(lua_State* L) {
     lsi_server* server = (lsi_server*)lua_touserdata(L, 1);
@@ -164,53 +288,13 @@ lsi_server_process_events(lua_State* L) {
         PIPE_INSTANCE* pipe = &server->instances[i];
         if (WaitForSingleObject(pipe->connectOverlap.hEvent, 0) == WAIT_OBJECT_0) {
             ResetEvent(pipe->connectOverlap.hEvent);
-            lsi_socket* client = (lsi_socket*)lua_newuserdatauv(L, sizeof(lsi_socket), 0);
-            if (client == NULL) {
-                return push_error(L, "malloc failed");
-            }
-            memset(client, 0, sizeof(lsi_socket));
-            luaL_getmetatable(L, LSI_SOCKET_METATABLE);
-            lua_setmetatable(L, -2);
-            client->server_owned = 1;
-            client->hPipe = pipe->hPipe;
-            int shouldAccept = 1;
-
-            if (hasOptions) {
-                if (lua_getfield(L, 2, "accept") == LUA_TFUNCTION) {
-                    // push client userdata
-                    lua_pushvalue(L, -2);
-                    if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
-                        // call error handler
-                        call_error_cb(L, "accept", 1, 2, pipe->hPipe, ERROR_CALLBACK_FAILED);
-                        shouldAccept = 0;
-                    } else if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
-                        // if call returns false, close the connection
-                        shouldAccept = 0;
-                    }
-                    lua_pop(L, 1); // discard return value
-                } else {
-                    lua_pop(L, 1); // discard nil
-                }
-            }
-
-            if (shouldAccept) {
-                pipe->buffer = (CHAR*)malloc(server->buffer_size * sizeof(CHAR));
-                ReadFile(pipe->hPipe, pipe->buffer, server->buffer_size, &pipe->bytesRead, &pipe->dataOverlap);
-                lua_getiuservalue(L, 1, 1);
-                lua_pushinteger(L, (int)client->hPipe);
-                lua_pushvalue(L, -3); // push client userdata
-                lua_settable(L, -3);
-                lua_pop(L, 1); // discard uv table
-            } else {
-                DisconnectAndReconnect(pipe);
-                client->closed = 1;
-            }
-            lua_pop(L, 1); // discard client userdata
+            accept_client(L, server, i);
         }
     }
     // data
     for (int i = 0; i < server->max_clients; i++) {
         PIPE_INSTANCE* pipe = &server->instances[i];
+        lua_Integer clientid = (lua_Integer)pipe->hPipe;
         if (WaitForSingleObject(pipe->dataOverlap.hEvent, 0) == WAIT_OBJECT_0) {
             ResetEvent(pipe->dataOverlap.hEvent);
 
@@ -218,37 +302,19 @@ lsi_server_process_events(lua_State* L) {
             if (!fSuccess) {
                 if (GetLastError() == ERROR_BROKEN_PIPE) {
                     // Client disconnected
-                    call_cb(L, "disconnect", 1, 2, pipe->hPipe);
-                    remove_client_from_server(L, 1, pipe->hPipe);
-                    if (DisconnectAndReconnect(pipe) == INVALID_HANDLE_VALUE) {
-                        call_error_cb(L, "internal", 1, 2, pipe->hPipe, ERROR_FAILED_TO_RECREATE_PIPE);
-                    }
+                    client_disconnected(L, server, i);
                 } else {
-                    call_error_cb(L, "read", 1, 2, pipe->hPipe, ERROR_READ_FAILED);
-                    remove_client_from_server(L, 1, pipe->hPipe);
+                    callback_error(L, "read", &clientid, ERROR_READ_FAILED);
+                    remove_client_from_server(L, clientid);
                     if (DisconnectAndReconnect(pipe) == INVALID_HANDLE_VALUE) {
-                        call_error_cb(L, "internal", 1, 2, pipe->hPipe, ERROR_FAILED_TO_RECREATE_PIPE);
+                        callback_error(L, "internal", &clientid, ERROR_FAILED_TO_RECREATE_PIPE);
                     }
                 }
             } else {
                 if (pipe->bytesRead > 0) {
-                    call_cb(L, "data", 1, 2, pipe->hPipe);
-                    if (hasOptions) {
-                        if (lua_getfield(L, 2, "data") == LUA_TFUNCTION) {
-                            push_client_from_server(L, 1, pipe->hPipe);
-                            lua_pushlstring(L, pipe->buffer, pipe->bytesRead);
-                            if ((lua_pcall(L, 2, 0, 0) != LUA_OK)) {
-                                call_error_cb(L, "data", 1, 2, pipe->hPipe, ERROR_CALLBACK_FAILED);
-                            }
-                        } else {
-                            lua_pop(L, 1); // discard nil
-                        }
-                    }
+                    data_received(L, clientid, pipe->buffer, pipe->bytesRead);
                 } else { // no data read, client may have disconnected
-                    remove_client_from_server(L, 1, pipe->hPipe);
-                    if (DisconnectAndReconnect(pipe) == INVALID_HANDLE_VALUE) {
-                        call_error_cb(L, "internal", 1, 2, pipe->hPipe, ERROR_FAILED_TO_RECREATE_PIPE);
-                    }
+                    client_disconnected(L, server, i);
                 }
             }
         }
@@ -262,136 +328,25 @@ lsi_server_process_events(lua_State* L) {
     // Check for new connection
     if (server->fds[0].revents & POLLIN) {
         // accept in while loop
-        while (1) {
-            lsi_socket* client = (lsi_socket*)lua_newuserdatauv(L, sizeof(lsi_socket), 0);
-            if (client == NULL) {
-                return push_error(L, "malloc failed");
-            }
-            memset(client, 0, sizeof(lsi_socket));
-            luaL_getmetatable(L, LSI_SOCKET_METATABLE);
-            lua_setmetatable(L, -2);
-            client->fd = accept(server->fd, NULL, NULL);
-            client->server_owned = 1;
-            if (client->fd == -1) {
-                client->closed = 1;
-                lua_pop(L, 1); // discard client userdata
-                break;
-            }
-
-            // Add new client to the poll fds
-            if (server->client_count < server->max_clients) {
-                int shouldAccept = 1;
-
-                if (hasOptions) {
-                    if (lua_getfield(L, 2, "accept") == LUA_TFUNCTION) {
-                        // push client userdata
-                        lua_pushvalue(L, -2);
-                        if (lua_pcall(L, 1, 1, 0) != LUA_OK) {
-                            // call error handler
-                            if (hasOptions) {
-                                if (lua_getfield(L, 2, "error") == LUA_TFUNCTION) {
-                                    // call error handler with the error pushed by lua_pcall
-                                    push_cb_error_info(L, "accept", ERROR_CALLBACK_FAILED);
-                                    lua_pushvalue(L, -4); // push client userdata
-                                    lua_pcall(L, 4, 0, 0);
-                                } else {
-                                    lua_pop(L, 1); // discard nil
-                                }
-                            }
-                            shouldAccept = 0;
-                        } else if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
-                            // if call returns false, close the connection
-                            shouldAccept = 0;
-                        }
-                        lua_pop(L, 1); // discard return value
-                    } else {
-                        lua_pop(L, 1); // discard nil
-                    }
-                }
-                if (shouldAccept) {
-                    server->fds[server->nfds].fd = client->fd;
-                    server->fds[server->nfds].events = POLLIN;
-                    server->nfds++;
-                    server->client_count++;
-                    // add client to the uv table
-                    lua_getiuservalue(L, 1, 1);
-                    lua_pushinteger(L, client->fd);
-                    lua_pushvalue(L, -3); // push client userdata
-                    lua_settable(L, -3);
-                    lua_pop(L, 1); // discard uv table
-                } else {
-                    close(client->fd);
-                    client->closed = 1;
-                }
-                lua_pop(L, 1); // discard client userdata
-            } else {
-                if (hasOptions) {
-                    if (lua_getfield(L, 2, "error") == LUA_TFUNCTION) {
-                        lua_pushstring(L, "accept");
-                        lua_pushstring(L, ERROR_CLIENT_LIMIT_REACHED);
-                        lua_pcall(L, 2, 0, 0);
-                    } else {
-                        lua_pop(L, 1); // discard nil
-                    }
-                }
-                close(client->fd);
-                client->closed = 1;
-                lua_pop(L, 1); // discard client userdata
-                break;
-            }
-        }
+        while (accept_client(L, server, 0 /* instance index is relevant only in windows version */)) {}
     }
     // Check each client for data
     char* buffer = malloc(server->buffer_size * sizeof(char));
     for (int i = 1; i < server->nfds; i++) {
         if (server->fds[i].revents & POLLIN) {
-            while (1) {
-                ssize_t count = read(server->fds[i].fd, buffer, server->buffer_size);
-                if (count == -1) {
-                    if (hasOptions) {
-                        if (lua_getfield(L, 2, "error") == LUA_TFUNCTION) {
-                            push_cb_error_info(L, "read", "read failed");
-                            push_client_from_server(L, 1, server->fds[i].fd);
-                            lua_pcall(L, 4, 0, 0);
-                        } else {
-                            lua_pop(L, 1); // discard nil
-                        }
-                    }
-
-                    if (errno != EAGAIN && errno != EWOULDBLOCK) {
-                        remove_client_from_server(L, 1, server->fds[i].fd);
-                        server->fds[i].fd = -1;
-                        server->client_count--;
-                    }
-
-                    break;
-                } else if (count == 0) {
-                    // Client disconnected
-                    if (hasOptions) {
-                        if (lua_getfield(L, 2, "disconnect") == LUA_TFUNCTION) {
-                            lua_pushstring(L, "disconnect");
-                            push_client_from_server(L, 1, server->fds[i].fd);
-                            lua_pcall(L, 2, 0, 0);
-                        } else {
-                            lua_pop(L, 1); // discard nil
-                        }
-                    }
-                    remove_client_from_server(L, 1, server->fds[i].fd);
+            lua_Integer clientid = (lua_Integer)server->fds[i].fd;
+            ssize_t count = read(server->fds[i].fd, buffer, server->buffer_size);
+            if (count == -1) {
+                if (errno != EAGAIN && errno != EWOULDBLOCK) {
+                    callback_error(L, "read", &clientid, ERROR_READ_FAILED);
+                    remove_client_from_server(L, clientid);
                     server->fds[i].fd = -1;
                     server->client_count--;
-                    break;
-                } else {
-                    // Process data
-                    if (hasOptions) {
-                        if (lua_getfield(L, 2, "data") == LUA_TFUNCTION) {
-                            push_client_from_server(L, 1, server->fds[i].fd);
-                            lua_pushlstring(L, buffer, count);
-                            lua_pcall(L, 2, 0, 0);
-                        } else {
-                            lua_pop(L, 1); // discard nil
-                        }
-                    }
                 }
+            } else if (count == 0) {
+                client_disconnected(L, server, i);
+            } else {
+                data_received(L, clientid, buffer, count);
             }
         }
     }
@@ -648,6 +603,16 @@ lsi_server_equals(lua_State* L) {
 }
 
 int
+lsi_server_get_client_limit(lua_State* L) {
+    lsi_server* server = (lsi_server*)luaL_checkudata(L, 1, LSI_SERVER_METATABLE);
+    if (server == NULL) {
+        return push_error(L, ERROR_SERVER_IS_NIL);
+    }
+    lua_pushinteger(L, server->max_clients);
+    return 1;
+}
+
+int
 lsi_create_server_meta(lua_State* L) {
     luaL_newmetatable(L, LSI_SERVER_METATABLE);
 
@@ -659,6 +624,8 @@ lsi_create_server_meta(lua_State* L) {
     lua_setfield(L, -2, "process_events");
     lua_pushcfunction(L, lsi_server_clients);
     lua_setfield(L, -2, "get_clients");
+    lua_pushcfunction(L, lsi_server_tostring);
+    lua_setfield(L, -2, "get_client_limit");
     lua_pushcfunction(L, lsi_server_tostring);
     lua_setfield(L, -2, "__tostring");
     lua_pushstring(L, LSI_SERVER_METATABLE);
