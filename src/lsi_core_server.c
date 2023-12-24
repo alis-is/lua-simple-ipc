@@ -85,7 +85,7 @@ callback_error(lua_State* L, const char* id, lua_Integer* clientid, const char* 
     if (lua_type(L, 2) == LUA_TTABLE) {
         if (lua_getfield(L, 2, "error") == LUA_TFUNCTION) {
             // call error handler with the error pushed by lua_pcall
-            lua_pushstring(L, "internal"); // error "accept"
+            lua_pushstring(L, id); // error id
             push_error_string(L, id);
             if (id != NULL) {
                 push_client_from_server(L, *clientid);
