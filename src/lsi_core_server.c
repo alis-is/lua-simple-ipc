@@ -232,7 +232,6 @@ client_disconnected(lua_State* L, lsi_server* server, int instanceIndex) {
         callback_error(L, "internal", &clientid, ERROR_FAILED_TO_RECREATE_PIPE);
     }
 #else
-    close(client->fd);
     server->fds[instanceIndex].fd = -1;
     server->client_count--;
 #endif
