@@ -581,7 +581,7 @@ lst_server_close(lua_State* L) {
         lua_pushnil(L);                 // uv nil
         while (lua_next(L, -2) != 0) {  // uv key value
             lua_pushstring(L, "close"); // uv key value "close"
-            lua_gettable(L, -3);        // uv key value close
+            lua_gettable(L, -2);        // uv key value close
             if (lua_type(L, -1) == LUA_TFUNCTION) {
                 lua_pushvalue(L, -2); // uv key value close value
                 if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
