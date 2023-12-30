@@ -545,7 +545,10 @@ lst_server_close(lua_State* L) {
     }
     server->closed = 1;
 
+    int closeClients = lua_toboolean(L, 2);
+
 #ifdef _WIN32
+    //close_server_handles(server);
     for (int i = 0; i < server->max_clients; i++) {
         CloseHandle(server->hEvents[i * 2]);
         CloseHandle(server->hEvents[i * 2 + 1]);
@@ -553,6 +556,10 @@ lst_server_close(lua_State* L) {
     }
     free(server->hEvents);
     free(server->instances);
+
+    if (server->path != NULL) {
+        free((void*)server->path);
+    }
 #else
     server->client_count = 0;
     server->nfds = 0;
@@ -568,6 +575,25 @@ lst_server_close(lua_State* L) {
         server->fd = -1;
     }
 #endif
+
+    if (closeClients) {
+        lua_getiuservalue(L, 1, 1);     // uv
+        lua_pushnil(L);                 // uv nil
+        while (lua_next(L, -2) != 0) {  // uv key value
+            lua_pushstring(L, "close"); // uv key value "close"
+            lua_gettable(L, -3);        // uv key value close
+            if (lua_type(L, -1) == LUA_TFUNCTION) {
+                lua_pushvalue(L, -2); // uv key value close value
+                if (lua_pcall(L, 1, 0, 0) != LUA_OK) {
+                    lua_pop(L, 1); // discard error
+                }
+            } else {
+                lua_pop(L, 1); // discard nil
+            }                  // uv key value
+            lua_pop(L, 1);     // uv key
+        }
+        lua_pop(L, 1); // discard uv
+    }
     return 0;
 }
 
