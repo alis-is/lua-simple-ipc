@@ -64,6 +64,8 @@ static HANDLE
 DisconnectAndReconnect(PIPE_INSTANCE* pipeInst) {
     ResetEvent(pipeInst->connectOverlap.hEvent);
     free(pipeInst->buffer);
+    pipeInst->buffer = NULL;
+    pipeInst->clientOwned = 0;
     // Disconnect the current pipe instance
     if (!DisconnectNamedPipe(pipeInst->hPipe)) {
         return INVALID_HANDLE_VALUE;
@@ -131,6 +133,7 @@ accept_client(lua_State* L, lsi_server* server, int instanceIndex) {
 #ifdef _WIN32
     PIPE_INSTANCE* pipe = &server->instances[instanceIndex];
     client->hPipe = pipe->hPipe;
+    pipe->clientOwned = 1;
     lua_Integer clientid = (lua_Integer)pipe->hPipe;
 #else
     client->fd = accept(server->fd, NULL, NULL);
@@ -553,6 +556,12 @@ lst_server_close(lua_State* L) {
         CloseHandle(server->hEvents[i * 2]);
         CloseHandle(server->hEvents[i * 2 + 1]);
         // we do not close the pipe handles here, because they are owned by the client userdata
+        if (server->instances[i].buffer != NULL) {
+            free(server->instances[i].buffer);
+        }
+        if (!server->instances[i].clientOwned) {
+            CloseHandle(server->instances[i].hPipe);
+        }
     }
     free(server->hEvents);
     free(server->instances);

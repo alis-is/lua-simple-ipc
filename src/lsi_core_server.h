@@ -17,6 +17,7 @@ typedef struct {
     OVERLAPPED dataOverlap;
     CHAR* buffer;
     DWORD bytesRead;
+    BOOL clientOwned;
 } PIPE_INSTANCE;
 #endif
 
