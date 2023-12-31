@@ -560,6 +560,7 @@ lst_server_close(lua_State* L) {
             free(server->instances[i].buffer);
         }
         if (!server->instances[i].clientOwned) {
+            // close the pipe handle only if it is not owned by the client userdata
             CloseHandle(server->instances[i].hPipe);
         }
     }

@@ -8,15 +8,14 @@ get_endpoint_path(const char* endpoint, size_t* endpoint_len) {
         return NULL;
     }
 #ifdef _WIN32
-    int needsPrefix = strncmp(endpoint, PIPE_PREFIX, strlen(PIPE_PREFIX)) != 0;
+    int needsPrefix = endpoint_len <= PIPE_PREFIX_LEN || strncmp(endpoint, PIPE_PREFIX, PIPE_PREFIX_LEN) != 0;
 
-    size_t pipe_prefix_len = needsPrefix ? strlen(PIPE_PREFIX) : 0;
-    size_t result_len = pipe_prefix_len + *endpoint_len + 1;
+    size_t pipe_prefix_len = needsPrefix ? PIPE_PREFIX_LEN : 0;
+    size_t result_len = pipe_prefix_len + *endpoint_len;
 #else
     size_t pipe_prefix_len = 0;
-    size_t result_len = *endpoint_len + 1;
+    size_t result_len = *endpoint_len;
 #endif
-    *endpoint_len = result_len - 1;
 
     char* result = malloc(result_len);
     if (result == NULL) {
@@ -30,9 +29,10 @@ get_endpoint_path(const char* endpoint, size_t* endpoint_len) {
         }
     }
 #endif
-    if (memcpy((void*)(result + pipe_prefix_len), endpoint, *endpoint_len + 1) == NULL) {
+    if (memcpy((void*)(result + pipe_prefix_len), endpoint, *endpoint_len) == NULL) {
         free((void*)result);
         return NULL;
     }
+    *endpoint_len = result_len;
     return result;
 }
