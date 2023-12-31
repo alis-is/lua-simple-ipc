@@ -369,12 +369,7 @@ lsi_server_process_events(lua_State* L) {
 }
 
 lsi_server*
-create_server_instance(lua_State* L) {
-    size_t path_len;
-    const char* path = (char*)luaL_checklstring(L, 1, &path_len);
-    if (path == NULL) {
-        return NULL;
-    }
+create_server_instance(lua_State* L, const char* path, size_t path_len) {
     lsi_server* server = (lsi_server*)lua_newuserdatauv(L, sizeof(lsi_server), 1);
     if (server == NULL) {
         return NULL;
@@ -435,7 +430,17 @@ close_server_handles(lsi_server* server) {
 
 int
 lsi_listen(lua_State* L) {
-    lsi_server* server = create_server_instance(L);
+    size_t path_len;
+    const char* path = (char*)luaL_checklstring(L, 1, &path_len);
+    if (path == NULL) {
+        return push_error(L, ERROR_PATH_IS_NIL);
+    }
+
+    if (path_len > MAX_PATH_LEN) {
+        return push_error(L, ERROR_PATH_TOO_LONG);
+    }
+
+    lsi_server* server = create_server_instance(L, path, path_len);
     if (server == NULL) {
         return push_error(L, ERROR_FAILED_TO_CREATE_SERVER_INSTANCE);
     }

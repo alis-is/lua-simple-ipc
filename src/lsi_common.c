@@ -17,7 +17,7 @@ get_endpoint_path(const char* endpoint, size_t* endpoint_len) {
     size_t result_len = *endpoint_len;
 #endif
 
-    char* result = malloc(result_len);
+    char* result = malloc(result_len + 1);
     if (result == NULL) {
         return NULL;
     }
@@ -33,6 +33,7 @@ get_endpoint_path(const char* endpoint, size_t* endpoint_len) {
         free((void*)result);
         return NULL;
     }
+    result[result_len] = '\0'; // null-terminate the string`
     *endpoint_len = result_len;
     return result;
 }

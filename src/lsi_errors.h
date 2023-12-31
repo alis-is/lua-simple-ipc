@@ -9,6 +9,7 @@
 #define ERROR_SOCKET_IS_NIL                    "socket is nil"
 #define ERROR_SOCKET_CLOSED                    "socket is closed"
 #define ERROR_PATH_IS_NIL                      "path is nil"
+#define ERROR_PATH_TOO_LONG                    "path is too long"
 #define ERROR_TIMEOUT                          "timeout"
 #define ERROR_POLL_FAILED                      "poll failed"
 #define ERROR_WRITE_FAILED                     "write failed"
