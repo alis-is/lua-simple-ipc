@@ -51,14 +51,29 @@ static HANDLE CreateNewPipeInstance(const lsi_server *server,
 		return INVALID_HANDLE_VALUE;
 	}
 
-	// Start an overlapped connection for this pipe instance
-	BOOL fConnected =
-		ConnectNamedPipe(pipeInst->hPipe, &pipeInst->connectOverlap) ?
-			TRUE :
-			(GetLastError() == ERROR_IO_PENDING);
+	// Initialize the overlap event
+	// (Ensure event is reset before connecting, though CreateEvent usually makes it non-signaled)
+	ResetEvent(pipeInst->connectOverlap.hEvent);
 
-	if (!fConnected && GetLastError() != ERROR_IO_PENDING &&
-	    GetLastError() != ERROR_PIPE_CONNECTED) {
+	// Start an overlapped connection for this pipe instance
+	BOOL result =
+		ConnectNamedPipe(pipeInst->hPipe, &pipeInst->connectOverlap);
+	DWORD err = GetLastError();
+
+	if (result) {
+		// [CASE 1] Succeeded immediately.
+		// With overlapped I/O, this is rare but possible.
+		// The event might not be signaled by OS, so we signal it to wake up the loop.
+		SetEvent(pipeInst->connectOverlap.hEvent);
+	} else if (err == ERROR_PIPE_CONNECTED) {
+		// [CASE 2] Client connected between CreateNamedPipe and ConnectNamedPipe.
+		// The operation is considered complete, but the event is NOT signaled by the OS.
+		// We must signal it manually.
+		SetEvent(pipeInst->connectOverlap.hEvent);
+	} else if (err == ERROR_IO_PENDING) {
+		// [CASE 3] Standard async behavior. The event will be signaled by OS later.
+	} else {
+		// [CASE 4] Actual error.
 		CloseHandle(pipeInst->hPipe);
 		return INVALID_HANDLE_VALUE;
 	}
@@ -68,25 +83,39 @@ static HANDLE CreateNewPipeInstance(const lsi_server *server,
 
 static HANDLE DisconnectAndReconnect(PIPE_INSTANCE *pipeInst)
 {
+	// Reset the event before starting new operations
 	ResetEvent(pipeInst->connectOverlap.hEvent);
-	free(pipeInst->buffer);
-	pipeInst->buffer = NULL;
-	pipeInst->clientOwned = 0;
-	// Disconnect the current pipe instance
-	if (!DisconnectNamedPipe(pipeInst->hPipe)) {
-		return INVALID_HANDLE_VALUE;
+
+	if (pipeInst->buffer) {
+		free(pipeInst->buffer);
+		pipeInst->buffer = NULL;
 	}
+	pipeInst->clientOwned = 0;
+
+	// Disconnect the current pipe instance
+	// Note: If the client has already closed, this might fail, but we usually ignore it
+	// and proceed to reconnect.
+	DisconnectNamedPipe(pipeInst->hPipe);
 
 	// Reconnect the pipe for a new client
-	BOOL fConnected =
-		ConnectNamedPipe(pipeInst->hPipe, &pipeInst->connectOverlap) ?
-			FALSE :
-			(GetLastError() == ERROR_IO_PENDING);
-	if (!fConnected && GetLastError() != ERROR_IO_PENDING &&
-	    GetLastError() != ERROR_PIPE_CONNECTED) {
+	BOOL result =
+		ConnectNamedPipe(pipeInst->hPipe, &pipeInst->connectOverlap);
+	DWORD err = GetLastError();
+
+	if (result) {
+		// [CASE 1] Succeeded immediately.
+		SetEvent(pipeInst->connectOverlap.hEvent);
+	} else if (err == ERROR_PIPE_CONNECTED) {
+		// [CASE 2] Client connected immediately (race condition or fast retry).
+		SetEvent(pipeInst->connectOverlap.hEvent);
+	} else if (err == ERROR_IO_PENDING) {
+		// [CASE 3] Pending.
+	} else {
+		// [CASE 4] Error.
 		CloseHandle(pipeInst->hPipe);
 		return INVALID_HANDLE_VALUE;
 	}
+
 	return pipeInst->hPipe;
 }
 #endif

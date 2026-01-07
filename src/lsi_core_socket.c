@@ -1,4 +1,3 @@
-
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -49,6 +48,14 @@ int lsi_socket_connect(lua_State *L)
 		sock->closed = 1;
 		return push_error(L, ERROR_FAILED_TO_CONNECT);
 	}
+
+	// Switch to message read mode to match server behavior
+	DWORD mode = PIPE_READMODE_MESSAGE;
+	if (!SetNamedPipeHandleState(sock->hPipe, &mode, NULL, NULL)) {
+		CloseHandle(sock->hPipe);
+		sock->closed = 1;
+		return push_error(L, ERROR_FAILED_TO_CONNECT);
+	}
 #else
 	sock->fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (sock->fd == -1) {
@@ -84,6 +91,8 @@ int lsi_socket_close(lua_State *L)
 	}
 #ifdef _WIN32
 	if (sock->hPipe != INVALID_HANDLE_VALUE) {
+		// Cancel any pending IO before closing to prevent corruption
+		CancelIo(sock->hPipe);
 		CloseHandle(sock->hPipe);
 		sock->hPipe = INVALID_HANDLE_VALUE;
 	}
@@ -111,9 +120,29 @@ int lsi_socket_write(lua_State *L)
 	const char *data = luaL_checklstring(L, 2, &datasize);
 #ifdef _WIN32
 	DWORD bytes_written;
-	if (WriteFile(sock->hPipe, data, datasize, &bytes_written, NULL) == 0) {
-		return push_error(L, ERROR_WRITE_FAILED);
+	OVERLAPPED overlapped;
+	memset(&overlapped, 0, sizeof(overlapped));
+	overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+	if (!WriteFile(sock->hPipe, data, datasize, &bytes_written,
+		       &overlapped)) {
+		if (GetLastError() != ERROR_IO_PENDING) {
+			CloseHandle(overlapped.hEvent);
+			return push_error(L, ERROR_WRITE_FAILED);
+		}
+		// Wait for completion
+		if (WaitForSingleObject(overlapped.hEvent, INFINITE) !=
+		    WAIT_OBJECT_0) {
+			CloseHandle(overlapped.hEvent);
+			return push_error(L, ERROR_WRITE_FAILED);
+		}
+		if (!GetOverlappedResult(sock->hPipe, &overlapped,
+					 &bytes_written, FALSE)) {
+			CloseHandle(overlapped.hEvent);
+			return push_error(L, ERROR_WRITE_FAILED);
+		}
 	}
+	CloseHandle(overlapped.hEvent);
 #else
 	if (write(sock->fd, data, datasize) == -1) {
 		return push_error(L, ERROR_WRITE_FAILED);
@@ -147,53 +176,66 @@ int lsi_socket_read(lua_State *L)
 	}
 
 #ifdef _WIN32
-	DWORD bytes_read;
+	DWORD bytes_read = 0;
 	char *buffer = (char *)malloc(buffer_size);
-	if (timeout >= 0) {
-		OVERLAPPED overlapped;
-		memset(&overlapped, 0, sizeof(overlapped));
-		overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-		if (overlapped.hEvent == NULL) {
-			return push_error(L, ERROR_READ_FAILED);
-		}
-		if (ReadFile(sock->hPipe, buffer, buffer_size, &bytes_read,
-			     &overlapped) == 0) {
-			if (GetLastError() != ERROR_IO_PENDING) {
-				CloseHandle(overlapped.hEvent);
-				free((void *)buffer);
-				return push_error(L, ERROR_READ_FAILED);
-			}
-			DWORD wait_res =
-				WaitForSingleObject(overlapped.hEvent, timeout);
-			if (wait_res == WAIT_FAILED) {
-				CloseHandle(overlapped.hEvent);
-				free((void *)buffer);
-				return push_error(L, ERROR_POLL_FAILED);
-			}
-			if (wait_res == WAIT_TIMEOUT) {
-				CloseHandle(overlapped.hEvent);
-				free((void *)buffer);
-				lua_pushnil(L);
-				lua_pushstring(L, "timeout");
-				return 2;
-			}
-			if (GetOverlappedResult(sock->hPipe, &overlapped,
-						&bytes_read, FALSE) == 0) {
-				CloseHandle(overlapped.hEvent);
-				free((void *)buffer);
-				return push_error(L, ERROR_READ_FAILED);
-			}
-		}
-		CloseHandle(overlapped.hEvent);
-	} else {
-		if (ReadFile(sock->hPipe, buffer, buffer_size, &bytes_read,
-			     NULL) == 0) {
-			free((void *)buffer);
-			return push_error(L, ERROR_READ_FAILED);
-		}
+	if (buffer == NULL)
+		return push_error(L, "malloc failed");
+
+	OVERLAPPED overlapped;
+	memset(&overlapped, 0, sizeof(overlapped));
+	overlapped.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+
+	if (overlapped.hEvent == NULL) {
+		free(buffer);
+		return push_error(L, ERROR_READ_FAILED);
 	}
 
+	BOOL readSuccess = ReadFile(sock->hPipe, buffer, buffer_size,
+				    &bytes_read, &overlapped);
+
+	if (!readSuccess && GetLastError() == ERROR_IO_PENDING) {
+		// Wait for data or timeout
+		DWORD waitMs = (timeout >= 0) ? timeout : INFINITE;
+		DWORD waitRes = WaitForSingleObject(overlapped.hEvent, waitMs);
+
+		if (waitRes == WAIT_OBJECT_0) {
+			// Success, get result
+			if (!GetOverlappedResult(sock->hPipe, &overlapped,
+						 &bytes_read, FALSE)) {
+				CloseHandle(overlapped.hEvent);
+				free(buffer);
+				return push_error(L, ERROR_READ_FAILED);
+			}
+		} else if (waitRes == WAIT_TIMEOUT) {
+			// TIMEOUT: Must cancel IO before freeing buffer!
+			CancelIo(sock->hPipe);
+			// Wait for cancel to effectively finish (GetOverlappedResult will return FALSE/CANCELLED)
+			GetOverlappedResult(sock->hPipe, &overlapped,
+					    &bytes_read, TRUE);
+
+			CloseHandle(overlapped.hEvent);
+			free(buffer);
+			lua_pushnil(L);
+			lua_pushstring(L, "timeout");
+			return 2;
+		} else {
+			// Error in Wait
+			CloseHandle(overlapped.hEvent);
+			free(buffer);
+			return push_error(L, ERROR_POLL_FAILED);
+		}
+	} else if (!readSuccess) {
+		// Immediate Error
+		CloseHandle(overlapped.hEvent);
+		free(buffer);
+		return push_error(L, ERROR_READ_FAILED);
+	}
+
+	// Immediate Success (readSuccess == TRUE)
+	CloseHandle(overlapped.hEvent);
 	lua_pushlstring(L, buffer, bytes_read);
+	free(buffer);
+	return 1;
 #else
 	if (timeout >= 0) {
 		struct pollfd fds[1];
@@ -205,7 +247,7 @@ int lsi_socket_read(lua_State *L)
 		}
 		if (poll_res == 0) {
 			lua_pushnil(L);
-			lua_pushstring(L, ERROR_TIMEOUT);
+			lua_pushstring(L, "timeout");
 			return 2;
 		}
 	}
@@ -220,10 +262,9 @@ int lsi_socket_read(lua_State *L)
 		return push_error(L, ERROR_READ_FAILED);
 	}
 	lua_pushlstring(L, buffer, read_size);
-#endif
-
 	free((void *)buffer);
 	return 1;
+#endif
 }
 
 int lsi_socket_is_nonblocking(lua_State *L)
